@@ -18,6 +18,9 @@ const path = require('path');
 const pslist = require('ps-list');
 const unzip = require('unzip-stream');
 const { glob } = require('glob');
+const { spawnSync } = require('child_process');
+const { EOL } = require('os');
+const { ta } = require('date-fns/locale');
 
 const tsConfigFile = './tsconfig.json';
 const tsconfig = require(tsConfigFile);
@@ -136,7 +139,7 @@ function binplace(compName, relativePath) {
     });
 }
 
-async function createDist() {
+async function populateDist() {
     fs.emptyDirSync(distdir);
     binplace('SoPa', path.join('sopa', 'content', 'bin', 'coretools'));
     binplace('pac CLI', path.join('pac', 'tools'));
@@ -158,18 +161,80 @@ async function createDist() {
         });
 }
 
-const recompile = gulp.series(
+function runSilent(exeName, ...args) {
+    const cp = spawnSync(exeName, ...args, { cwd: __dirname, encoding: 'utf-8' });
+    if (cp.error) {
+        throw new Error(`run exe failed: ${cp.error}`);
+    }
+    const output = cp.output
+        .filter(line => !!line)
+        .map(line => line.trimEnd());
+    return [cp.status, output, cp.stdout, cp.stderr];
+}
+
+function run(exeName, ...args) {
+    log.info(`running: ${exeName} ${args.join(' ')}`);
+    const [status, output, stdout, stderr] = runSilent(exeName, args);
+    log.info(`(status: ${status})${EOL}${output.join(EOL)}`);
+    return [stdout, stderr];
+}
+
+async function setVersion() {
+    // https://docs.github.com/en/free-pro-team@latest/actions/reference/environment-variables#default-environment-variables
+    const branchName = process.env.GITHUB_REF;
+    const workflow = process.env.GITHUB_WORKFLOW;
+    const isOfficial = process.env.CI && branchName === 'main' || false;
+    const ver = require('./majorMinor.json');
+    // https://github.com/adamralph/minver
+    let [proposedTag, _] = run('dotnet', 'tool', 'run', 'minver', '--minimum-major-minor', `${ver.major}.${ver.minor}`, '--tag-prefix', 'v', '--default-pre-release-phase', 'preview');
+    // e.g.: "0.1.8-preview.0.2"
+    const fullVersion = proposedTag.trim();
+    log.info(`proposed new version: ${fullVersion}`);
+    const tags = [];
+    if (isOfficial) {
+        tags.push(fullVersion); // for CI builds of main, use the full tag
+    } else if (workflow === 'release') {
+        tags.push(fullVersion.split('-')[0]);    // for the official release, remove the preview part
+    } else {
+        log.info('Not tagging local or PR builds');
+    }
+    const token = process.env.GITHUB_TOKEN;
+    const pushToOrigin = token && tags.length > 0;
+    if (pushToOrigin) {
+        runSilent('git', ['config', '--local', 'http.https://github.com/.extraheader', `AUTHORIZATION: basic ${Buffer.from(`PAT:${token}`).toString('base64')}`]);
+    }
+    tags.forEach(tag => {
+        run('git', 'push', repoUrl, tag);
+        if (pushToOrigin) {
+            run('git', 'tag', '-f', tag);
+        }
+    });
+    runSilent('git', ['config', '--local', '--unset-all', 'http.https://github.com/.extraheader']);
+}
+
+// make them named functions so that gulp -T shows the task graph with actual function names:
+async function nugetPac() { await nugetInstall('CAP_ISVExp_Tools_Daily', 'Microsoft.PowerApps.CLI', '1.3.6-daily-20082523', path.resolve(outdir, 'pac')); }
+async function nugetSoPa() { await nugetInstall('nuget.org', 'Microsoft.CrmSdk.CoreTools', '9.1.0.49', path.resolve(outdir, 'sopa')); }
+async function restoreDotnetTools() { run('dotnet', 'tool', 'restore'); }
+
+const restore = gulp.series(
     clean,
-    async () => nugetInstall('CAP_ISVExp_Tools_Daily', 'Microsoft.PowerApps.CLI', '1.3.6-daily-20082523', path.resolve(outdir, 'pac')),
-    async () => nugetInstall('nuget.org', 'Microsoft.CrmSdk.CoreTools', '9.1.0.49', path.resolve(outdir, 'sopa')),
+    nugetPac,
+    nugetSoPa,
+    restoreDotnetTools,
+);
+
+const recompile = gulp.series(
+    restore,
     compile
 );
 
 const dist = gulp.series(
-    async () => createDist(),
+    populateDist,
 );
 
 exports.clean = clean;
+exports.restore = restore;
 exports.compile = compile;
 exports.recompile = recompile;
 exports.lint = lint;
@@ -180,4 +245,5 @@ exports.ci = gulp.series(
     test
 );
 exports.dist = dist;
+exports.setVersion = setVersion;
 exports.default = recompile;
